@@ -1,0 +1,225 @@
+---
+layout: post
+title:  "Making a vBNG from open source. Part 1"
+date:   2020-01-25 11:35:45 +0300
+categories: jekyll update
+---
+
+## Intro
+# Subject
+Let's imagine that some Internet Service Provider (ISP) network has legacy PPPoE clients. It may be good old BRASes - for example, Redback Networks SmartEdge or modern BNG solutions (Juniper MX or Cisco A9K). But what about NFV? We can use just general-purpose hardware and get great flexibility and performance. Moreover, we can build a whole disaggregated system: AAA - where all the sessions will be stored, some kind of controller to control plane, which can manage a whole cluster of vBNG or you can only imagine all the other cases. This is what the article about - creating VNF for terminating PPPoE clients.
+
+# Dataplane
+You can ask: "What's about DPDK?". It's just a toolkit for creating your dataplanes. Some time ago I was thinking about creating dataplane for a service router, but after a couple of attempts I can tell you with confidence: this is a pretty time-consuming process. 
+
+And that's where VPP is going to play. VPP is the most popular open-source dataplane. And today I will try to show you how can we use VPP in case of virtualized BNG. Fortunately, there is already a PPPoE plugin for VPP. So we can just try to write some control plane for VPP. Let's start with something simple.
+
+There is the plan:
+1. Build VPP
+2. Try to enable PPPoE plugin and see how it's dispatch packets
+3. Write our program to handling PPPoE/PPP packets and provisioning sessions to dataplane. 
+
+# Building VPP
+Firstly I found out that the PPPoE plugin is not working with the last versions of VPP. In the mailing list I find out that PPPoE plugin doesn’t meet new VPP design, so there is also a patch that makes plugin works again: [Mail list message with patch](https://lists.fd.io/g/vpp-dev/message/14063).
+
+```
+git clone https://github.com/FDio/vpp.git
+cd vpp/
+git checkout v19.08
+git apply --check pppoe.patch
+git apply --stat pppoe.patch
+git apply pppoe.patch
+git status
+git diff src/vnet/ethernet/node.c
+sudo apt install make
+make install-dep
+make
+make build
+```
+
+Of course, you noticed in the mail list message, that not everything made perfect in this plugin. But anyway this is a good start, we can go deep into this plugin a bit later.
+
+## Start
+# Enabling plugin
+Let's create a basic setup - just 2 interfaces. One for the PPPoE control plane and the other for subscriber access. 
+```
+vpp# create tap id 0 host-if-name pppoe-cp
+tap0
+vpp# create tap id 1 host-if-name sub
+tap1
+vpp# set interface state tap0 up
+vpp# set interface state tap1 up
+```
+
+Let's check ifindex for tap0 and setting PPPoE plugin for dispatching pppoe-cp to this interface:
+```
+vpp# show int
+              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     Counter          Count
+local0                            0     down          0/0/0/0
+tap0                              1      up          9000/0/0/0     rx packets                    11
+                                                                    rx bytes                     866
+                                                                    drops                         11
+                                                                    ip6                           11
+tap1                              2      up          9000/0/0/0     rx packets                     8
+                                                                    rx bytes                     656
+                                                                    drops                          8
+                                                                    ip6                            8
+vpp# create pppoe cp cp-if-index 1
+```
+
+Let's start `pppoe-discovery -I sub` and we will see:
+```
+vpp# trace add virtio-input 10
+vpp# show trace
+------------------- Start of thread 0 vpp_main -------------------
+Packet 1
+
+00:05:00:691427: virtio-input
+  virtio: hw_if_index 2 next-index 4 vring 0 len 24
+    hdr: flags 0x00 gso_type 0x00 hdr_len 0 gso_size 0 csum_start 0 csum_offset 0 num_buffers 1
+00:05:00:691438: ethernet-input
+  PPPOE_DISCOVERY: 7a:8d:bb:b3:2c:72 -> ff:ff:ff:ff:ff:ff
+00:05:00:691444: pppoe-cp-dispatch
+  PPPoE dispatch from sw_if_index 2 next 1 error 0
+  pppoe_code 0x9  ppp_proto 0x101
+00:05:00:691450: tap0-output
+  tap0 l2_hdr_offset_valid l3_hdr_offset_valid
+  PPPOE_DISCOVERY: 7a:8d:bb:b3:2c:72 -> ff:ff:ff:ff:ff:ff
+```
+
+Yes! The plugin works and we can move along.
+
+## Make some results
+# Writing control plane
+I've started to write PPPoE/PPP control plane daemon. Let's see things what we need to do:
+* First of all: dispatching control packets to our software (it is made by VPP plugin)
+* Handle PPPoE packets: PADI, PADO, PADR, PADS ([RFC PPPOE](https://tools.ietf.org/html/rfc2516))
+* Also PPP packets. It's a bit more complicated, we need to write a finite-state machine to handle all types of PPP protocols (in our case just LCP and IPCP). ([RFC PPP](https://tools.ietf.org/html/rfc1661), [RFC IPCP](https://tools.ietf.org/html/rfc1332))
+* AAA: at this point, we just authenticate all the sessions.
+* Configuring VPP: creating and deleting sessions through API.
+
+It's not finished project, because FSM for LCP packets is not ready, it's just an easy version just to support simple cases - I don't have timers for this FSM, just events.
+
+Anyway, we just trying to show Proof of Concept. There is [a project on Github](https://github.com/zstas/pppcpd).
+```
+git clone https://github.com/zstas/pppcpd.git
+cd pppcpd/
+make -j9
+make start
+```
+
+# Testing our suite
+Configuring VPP by hands, but of course, we can do it through the control plane daemon later.
+```
+zstas@vppbuild:~$ telnet 127.1 5002
+Trying 127.0.0.1...
+Connected to 127.1.
+Escape character is '^]'.
+    _______    _        _   _____  ___
+ __/ __/ _ \  (_)__    | | / / _ \/ _ \
+ _/ _// // / / / _ \   | |/ / ___/ ___/
+ /_/ /____(_)_/\___/   |___/_/  /_/
+
+vpp# show interface
+              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     Counter          Count
+local0                            0     down          0/0/0/0
+vpp# create tap id 0 host-if-name pppoe-cp
+tap0
+vpp# create tap id 1 host-if-name sub
+tap1
+vpp# set interface state tap0 up
+vpp# set interface state tap1 up
+vpp# show interface
+              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     Counter          Count
+local0                            0     down          0/0/0/0
+tap0                              1      up          9000/0/0/0     rx packets                     8
+                                                                    rx bytes                     656
+                                                                    drops                          8
+                                                                    ip6                            8
+tap1                              2      up          9000/0/0/0     rx packets                     8
+                                                                    rx bytes                     656
+                                                                    drops                          8
+                                                                    ip6                            8
+vpp# create pppoe cp cp-if-index 1
+```
+
+As before, we just create 2 tap interfaces, the first one (tap0 -> PPPoE-cp) is for our control plane. The second is an access interface for customers. Now we can configure pppd:
+```
+zstas@vppbuild:~$ cat /etc/ppp/peers/dsl-provider  | grep -v '#'
+noipdefault
+usepeerdns
+defaultroute
+
+hide-password
+lcp-echo-interval 20
+lcp-echo-failure 3
+connect /bin/true
+noauth
+persist
+mtu 1492
+noaccomp
+
+plugin rp-pppoe.so
+sub
+user "user"
+```
+
+Starting our dataplane. At this moment all the parameters hardcoded - interface name, IP pools and all the other staff:
+```
+zstas@vppbuild:~/pppcpd$ make start
+sudo ./pppcpd
+[sudo] password for zstas:
+PPPOE: Ifindex: 3
+PPPOE: Ifindex: 3
+PPPOE: VPPAPI cstr
+PPPOE: VPP API: connected
+```
+
+And after that we can start the PPPoE client:
+```
+zstas@vppbuild:~$ pppd call dsl-provider
+Plugin rp-pppoe.so loaded.
+```
+
+There is the dump on the subscriber interface:
+```
+11:59:41.504162 ce:be:9a:9a:1a:fc > ff:ff:ff:ff:ff:ff, ethertype PPPoE D (0x8863), length 24: PPPoE PADI [Service-Name]
+11:59:41.608281 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE D (0x8863), length 69: PPPoE PADO [AC-Name "vBNG AC PPPoE"] [Service-Name "internet"] [AC-Cookie "fa37JncCHryDsbza"]
+11:59:41.608407 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE D (0x8863), length 44: PPPoE PADR [Service-Name] [AC-Cookie "fa37JncCHryDsbza"]
+11:59:41.709407 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE D (0x8863), length 69: PPPoE PADS [ses 0x1] [AC-Name "vBNG AC PPPoE"] [Service-Name "internet"] [AC-Cookie "yy4cBWDxS22JjzhM"]
+11:59:41.732460 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 36: PPPoE  [ses 0x1] LCP (0xc021), length 16: LCP, Conf-Request (0x01), id 1, length 16
+11:59:42.748482 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 40: PPPoE  [ses 0x1] LCP (0xc021), length 20: LCP, Conf-Request (0x01), id 1, length 20
+11:59:42.748510 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 36: PPPoE  [ses 0x1] LCP (0xc021), length 16: LCP, Conf-Ack (0x02), id 1, length 16
+11:59:42.748858 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 40: PPPoE  [ses 0x1] LCP (0xc021), length 20: LCP, Conf-Ack (0x02), id 1, length 20
+11:59:42.748964 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 30: PPPoE  [ses 0x1] LCP (0xc021), length 10: LCP, Echo-Request (0x09), id 0, length 10
+11:59:42.749073 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 36: PPPoE  [ses 0x1] PAP (0xc023), length 16: PAP, Auth-Req (0x01), id 1, Peer user, Name pass
+11:59:42.749290 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 30: PPPoE  [ses 0x1] LCP (0xc021), length 10: LCP, Echo-Reply (0x0a), id 0, length 10
+11:59:42.850195 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 36: PPPoE  [ses 0x1] PAP (0xc023), length 7: PAP, Auth-ACK (0x02), id 1, Msg
+11:59:42.850391 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 44: PPPoE  [ses 0x1] IPCP (0x8021), length 24: IPCP, Conf-Request (0x01), id 1, length 24
+11:59:43.754783 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 32: PPPoE  [ses 0x1] IPCP (0x8021), length 12: IPCP, Conf-Request (0x01), id 1, length 12
+11:59:43.754801 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 44: PPPoE  [ses 0x1] IPCP (0x8021), length 24: IPCP, Conf-Nack (0x03), id 1, length 24
+11:59:43.754958 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 32: PPPoE  [ses 0x1] IPCP (0x8021), length 12: IPCP, Conf-Ack (0x02), id 1, length 12
+11:59:43.755002 ce:be:9a:9a:1a:fc > 02:fe:14:38:22:4d, ethertype PPPoE S (0x8864), length 44: PPPoE  [ses 0x1] IPCP (0x8021), length 24: IPCP, Conf-Request (0x01), id 2, length 24
+11:59:43.856442 02:fe:14:38:22:4d > ce:be:9a:9a:1a:fc, ethertype PPPoE S (0x8864), length 44: PPPoE  [ses 0x1] IPCP (0x8021), length 24: IPCP, Conf-Ack (0x02), id 2, length 24```
+```
+
+Seems good, let's check what's going on in VPP:
+```
+vpp# show pppoe session
+[0] sw-if-index 3 client-ip 100.64.0.10 session-id 1 encap-if-index 2 decap-fib-index 0
+    local-mac 02:fe:14:38:22:4d  client-mac ce:be:9a:9a:1a:fc
+vpp# show ip fib
+ipv4-VRF:0, fib_index:0, flow hash:[src dst sport dport proto ] locks:[src:plugin-hi:2, src:default-route:1, ]
+...
+100.64.0.10/32
+  unicast-ip4-chain
+  [@0]: dpo-load-balance: [proto:ip4 index:9 buckets:1 uRPF:7 to:[0:0]]
+    [0] [@6]: ipv4 [features] via 0.0.0.0 pppoe_session0: mtu:9000 cebe9a9a1afc02fe1438224d88641100000100000021
+        stacked-on:
+          [@3]: tap1-tx-dpo:
+```
+
+Cool! We just got the PPPoE session working!
+
+## To be continued...
+It's just the beginning of a series of articles about my experiment with VPP. Next time I'll tell more about how the PPP control plane daemon works.
