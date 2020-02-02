@@ -1,0 +1,196 @@
+---
+layout: post
+title:  "Making a vBNG from open source. Part 2"
+date:   2020-02-02 17:00:00 +0300
+categories: jekyll update
+---
+
+## Going deep
+# How does our PPP daemon work?
+We have one main thread, which serves 2 raw sockets (with ethertype of PPPoE Discovery and Session) and 4 packet queues - input and output for both protocols. Also, we have a couple of threads, one handle discovery packets and the second handle PPP control packets through these queues.
+
+As I said in the previous post - at this point daemon doesn’t fully realize PPP FSM, it just can process incoming packets. We need to build this daemon around some kind of event loop because for PPP FSM we need timers, so in the future, I’m planning to use Boost ASIO.
+
+## VPP API
+It is pretty easy to use VPP API in C++. We need just to include VAPI headers, choose which functions we need and then just connect to VPP and send some messages.
+
+# Making it working
+First, including the headers:
+```
+// General VPP API
+#include "vapi/vapi.hpp"
+#include "vapi/vpe.api.vapi.hpp"
+// VPP PPPOE plugin API
+#include "vapi/pppoe.api.vapi.hpp"
+```
+
+Second, we need to define functions. We can do it in 2 ways, just define all the functions from the headers or selectively defines just the functions we need. I chose to define all the functions.
+```
+DEFINE_VAPI_MSG_IDS_VPE_API_JSON
+DEFINE_VAPI_MSG_IDS_PPPOE_API_JSON
+```
+
+The final thing - I write the simple class to communicate with VPP:
+```
+struct VPPAPI {
+    vapi::Connection con;
+    VPPAPI() {
+        log( "VPPAPI cstr" );
+        auto ret = con.connect( "vbng", nullptr, 32, 32 );
+        if( ret == VAPI_OK ) {
+            log("VPP API: connected");
+        }
+    }
+    ~VPPAPI() {
+        auto ret = con.disconnect();
+        if( ret == VAPI_OK ) {
+            log("VPP API: disconnected");
+        }
+    }
+
+    bool add_pppoe_session( uint32_t ip_address, uint16_t session_id, std::array<uint8_t,6> mac, bool is_add = true );
+};
+```
+
+# Checking is it works
+If we run daemon we can see is our client connected to VPP or not:
+```
+vpp# show api clients
+Shared memory clients
+                Name      PID   Queue Length           Queue VA Health
+                vbng    27997             32 0x00000001301d09c0 OK
+```
+
+# How request looks like
+```
+bool VPPAPI::add_pppoe_session( ... ) {
+    vapi::Pppoe_add_del_session pppoe( con );
+
+    auto &req = pppoe.get_request().get_payload();
+
+    req.client_ip[0] = ( ip_address >> 24 ) & 0xFF;
+    // filling the rest of info for request
+
+    auto ret = pppoe.execute();
+    if( ret != VAPI_OK ) {
+        log( "error!" );
+    }
+
+    do {
+        ret = con.wait_for_response( pppoe );
+    } while( ret == VAPI_EAGAIN );
+
+    auto repl = pppoe.get_response().get_payload();
+    log( "added pppoe session: " + std::to_string( repl.sw_if_index ) );
+```
+
+And that' all! Pretty easy, isn't it?
+
+## PPPOE plugin in VPP
+# What's the graph?
+How is data processing in VPP looks like? Let's look on some trace:
+```
+19:39:10:297177: virtio-input
+  virtio: hw_if_index 2 next-index 4 vring 0 len 106
+    hdr: flags 0x00 gso_type 0x00 hdr_len 0 gso_size 0 csum_start 0 csum_offset 0 num_buffers 1
+19:39:10:297185: ethernet-input
+  PPPOE_SESSION: 7a:8d:bb:b3:2c:72 -> 02:fe:a7:12:83:1b
+19:39:10:297189: pppoe-input
+  PPPoE decap from pppoe_session0 session_id 2 next 1 error 0
+19:39:10:297195: ip4-input
+  ICMP: 100.64.0.11 -> 8.8.8.8
+    tos 0x00, ttl 64, length 84, checksum 0xce5b
+    fragment id 0xf7f2, flags DONT_FRAGMENT
+  ICMP echo_request checksum 0x89f2
+19:39:10:297199: ip4-lookup
+  fib 0 dpo-idx 10 flow hash: 0x00000000
+  ICMP: 100.64.0.11 -> 8.8.8.8
+    tos 0x00, ttl 64, length 84, checksum 0xce5b
+    fragment id 0xf7f2, flags DONT_FRAGMENT
+  ICMP echo_request checksum 0x89f2
+19:39:10:297202: ip4-load-balance
+  fib 0 dpo-idx 1 flow hash: 0x00000000
+  ICMP: 100.64.0.11 -> 8.8.8.8
+    tos 0x00, ttl 64, length 84, checksum 0xce5b
+    fragment id 0xf7f2, flags DONT_FRAGMENT
+  ICMP echo_request checksum 0x89f2
+19:39:10:297204: ip4-rewrite
+  tx_sw_if_index 4 dpo-idx 1 : ipv4 via 10.0.0.0 tap3: mtu:9000 e60921cefcaa02fe43428ee20800 flow hash: 0x00000000
+  00000000: e60921cefcaa02fe43428ee2080045000054f7f240003f01cf5b6440000b0808
+  00000020: 0808080089f27b0600124e4d355e00000000b0760000000000001011
+19:39:10:297205: tap3-output
+  tap3 l2_hdr_offset_valid l3_hdr_offset_valid
+  IP4: 02:fe:43:42:8e:e2 -> e6:09:21:ce:fc:aa
+  ICMP: 100.64.0.11 -> 8.8.8.8
+    tos 0x00, ttl 63, length 84, checksum 0xcf5b
+    fragment id 0xf7f2, flags DONT_FRAGMENT
+  ICMP echo_request checksum 0x89f2
+  ```
+
+Every packet in VPP processed through several functions called nodes, in the example above: virtio-input, ethernet-input, pppoe-input, ip4-input, etc. These nodes connected and the result is called a graph.
+
+For example, there are connections for the PPPoE plugin:
+```
+vpp# show vlib graph
+           Name                      Next                    Previous
+pppoe-cp-dispatch               error-drop [0]              pppoe-input
+                             interface-output [1]             pipe-rx
+                                                              l2-fwd
+                                                             l2-flood
+                                                       ethernet-input-not-l2
+                                                        ethernet-input-type
+                                                          ethernet-input
+
+pppoe-input                     error-drop [0]                pipe-rx
+                                 ip4-input [1]                l2-fwd
+                                 ip6-input [2]               l2-flood
+                             pppoe-cp-dispatch [3]     ethernet-input-not-l2
+                                                        ethernet-input-type
+                                                          ethernet-input
+```
+
+So there is a logic inside each node how traffic should be processed. Let's have a deep dive into the PPPoE plugin.
+
+First of all, the nodes are registered in VPP:
+```
+VLIB_REGISTER_NODE (pppoe_cp_dispatch_node) = {
+  .name = "pppoe-cp-dispatch",
+  //...
+};
+...
+VLIB_REGISTER_NODE (pppoe_input_node) = {
+  .name = "pppoe-input",
+  //...
+};
+```
+And then this is an init function for the plugin. It registered 2 nodes for each ethertype of PPPoE packets. Also, it initialized 2 hash tables.
+```
+clib_error_t *
+pppoe_init (vlib_main_t * vm)
+{
+  // emit some lines...
+
+  /* Create the hash table  */
+  BV (clib_bihash_init) (&pem->link_table, "pppoe link table", PPPOE_NUM_BUCKETS, PPPOE_MEMORY_SIZE);
+  BV (clib_bihash_init) (&pem->session_table, "pppoe session table", PPPOE_NUM_BUCKETS, PPPOE_MEMORY_SIZE);
+
+  ethernet_register_input_type (vm, ETHERNET_TYPE_PPPOE_SESSION, pppoe_input_node.index);
+  ethernet_register_input_type (vm, ETHERNET_TYPE_PPPOE_DISCOVERY, pppoe_cp_dispatch_node.index);
+
+  return 0;
+}
+```
+What's we have here? There is one hash table for matching mac + PPPoE session id as a key and ifindex for the ingress interface and session. Also, we can have a look at this hash table:
+```
+vpp# show pppoe fib
+    Mac-Address     session_id  sw_if_index  session_index
+ 7a:8d:bb:b3:2c:72       1           2             0
+ 7a:8d:bb:b3:2c:72       2           2            -1
+2 pppoe fib entries
+```
+And this is how it works: PPPoE discovery packets go straight to `pppoe_cp_dispatch_node` and this function filling up PPPoE FIB. On the other side `pppoe_input_node` processes the PPPoE session packets and if PPP proto field matches IPv4 or IPv6 - packet goes to the corresponding node. In all other cases, it punted to the PPPoE CP interface.
+
+# Outro
+What is also important for BNG? Right, we have a lack of dynamic routing. Because VPP is the only dataplane we need to punt routing protocols control traffic to the host and process them. 
+
+There is a `router plugin` for VPP, but it’s kind of outdated and not supported at all. I hope to make it works (or figure something else to make BGP works). I have a couple of thoughts and I will tell you about it in the next article.
