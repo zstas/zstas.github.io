@@ -1,0 +1,19 @@
+---
+layout: post
+title:  "Make BGP work again (in VPP)"
+date:   2020-02-29 17:00:00 +0300
+categories: jekyll update
+---
+
+# Make some dynamic routing
+In every BNG we need full stack of dynamic routing protocols: BGP, ISIS, OSPF. And there is more, we also need such daemons like LDP, BFD, PIM. But at this moment we will make only BGP works.
+
+## Choosing the daemon
+These days we have a variety of BGP daemons: FRR, Bird, GoBGP, ExaBGP - and there are only some popular ones. I decided to proceed with FRR, because it's have a special protocol to install routes to dataplane, it's called FPM (Forwarding Plane Manager).
+
+## FPM FIB Push
+FPM it's just a module for Zebra (it's like RIB daemon in FRR). To use FPM we need to listen some TCP port, and Zebra will connect and send all the FIB to us. At every change we will get full route information about route that changed. In case we lost TCP session we also will get the full FIB after the session will be established.
+
+There are two options of how data will be encoded in these messages: Netlink and Protobuf. I like Netlink, but chose Protobuf in this case, onlu because we can generate all the boilerplate - encoding/decoding messages from bytes and all the necessary classes.
+
+Let's see what we have here - FPM, Protobuf and of course VPP API. I write this litte programm, you can find it on my [github](https://github.com/zstas/pppcpd).
