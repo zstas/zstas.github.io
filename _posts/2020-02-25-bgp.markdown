@@ -1,0 +1,214 @@
+---
+layout: post
+title:  "Make BGP work again (in VPP)"
+date:   2020-02-25 21:00:00 +0300
+categories: jekyll update
+---
+
+## Make some dynamic routing
+In every BNG we need a full stack of dynamic routing protocols: BGP, ISIS, OSPF. And there is more, we also need such daemons like LDP, BFD, PIM. But at this moment we will make only BGP works.
+
+# Choosing the daemon
+These days we have a variety of BGP daemons: FRR, Bird, GoBGP, ExaBGP - and there are only some popular ones. I decided to proceed with FRR because it has a special protocol to install routes to dataplane, it's called FPM (Forwarding Plane Manager).
+
+# FPM FIB Push
+FPM just a module for Zebra (it's like RIB daemon in FRR). To use FPM we need to listen on some TCP port, and Zebra will connect and send all the FIB to us. At every change of the routing table, we will get full route information about the route that changed. In case we lost TCP session we also will get the full FIB after the session will be established.
+
+There are two options of how data will be encoded in these messages: Netlink and Protobuf. I like Netlink but chose Protobuf in this case, only because we can generate all the boilerplate - all the structures and functions for encoding/decoding messages from/to bytes.
+
+Let's see what we have here - FPM, Protobuf and of course VPP API. I write a little program that gets routes from Zebra and pushes them to the VPP. I named it like FIB Manager (`fibmgr`) and of course you can find it on my [github](https://github.com/zstas/pppcpd).
+
+# Run Zebra
+First of all, we need to run Zebra with an enabled FPM module (and selected Protobuf).
+
+Unfortunately, you need to recompile FRR with this option (because in Ubuntu's repos there is the only version which faults on run with these settings).
+
+```
+git clone https://github.com/FRRouting/frr.git
+cd frr
+git checkout frr-7.2.1
+./bootstrap.sh
+./configure
+./configure --enable-fpm --enable-protobuf
+make -j9
+sudo make install
+```
+
+And now we can run Zebra in foreground mode:
+```
+sudo zebra -f /etc/frr/zebra.conf -u root -M fpm:protobuf -t
+2020/02/23 12:32:18 warnings: ZEBRA: [EC 4043309105] Disabling MPLS support (no kernel support)
+2020/02/23 12:32:18 warnings: ZEBRA: [EC 4043309078] FPM protobuf message format is deprecated and scheduled to be removed. Please convert to using netlink format or contact dev@lists.frrouting.org with your use case.
+vppbuild# conf t
+vppbuild(config)# fpm connection ip 127.0.0.1 port 31337
+vppbuild(config)# end
+vppbuild#
+```
+
+Let's run our FIB manager `sudo ./fibmgr.o` and see that you receive some routing information:
+```
+type: ADD_ROUTE
+add_route {
+  vrf_id: 0
+  address_family: IPV4
+  sub_address_family: UNICAST
+  key {
+    prefix {
+      length: 0
+      bytes: ""
+    }
+  }
+  route_type: NORMAL
+  protocol: KERNEL
+  metric: 100
+  nexthops {
+    if_id {
+      index: 2
+    }
+    address {
+      v4 {
+        value: 167772674
+      }
+    }
+  }
+}
+```
+It's just default route from the host. Later we can isolate zebra to the separate network namespace.
+
+Add some static routes:
+```
+zstas@vppbuild:~$ sudo staticd -u root -t
+vppbuild# conf t
+vppbuild(config)# ip route 8.8.8.8/32 10.0.2.2
+vppbuild(config)# ip route 8.8.8.8/32 10.0.2.3
+vppbuild(config)# ip route 8.8.8.8/32 10.0.2.4
+vppbuild(config)# end
+```
+
+And check in VPP:
+```
+DBGvpp# show ip fib 8.8.8.8/32
+ipv4-VRF:0, fib_index:0, flow hash:[src dst sport dport proto ] epoch:0 flags:none locks:[default-route:1, nat-hi:2, ]
+8.8.8.8/32 fib:0 index:11 locks:2
+  API refs:1 src-flags:added,contributing,active,
+    path-list:[17] locks:2 flags:shared, uPRF-list:15 len:1 itfs:[0, ]
+      path:[18] pl-index:17 ip4 weight=1 pref=0 attached-nexthop:
+        10.0.2.2 local0
+      [@0]: ipv4 via 10.0.2.2 local0: mtu:9000
+      path:[19] pl-index:17 ip4 weight=1 pref=0 attached-nexthop:
+        10.0.2.3 local0
+      [@0]: ipv4 via 10.0.2.3 local0: mtu:9000
+      path:[20] pl-index:17 ip4 weight=1 pref=0 attached-nexthop:
+        10.0.2.4 local0
+      [@0]: ipv4 via 10.0.2.4 local0: mtu:9000
+```
+
+## Punting the control packets - Proof Of Concept
+But it's just a half-way to get BGP working. We need to punt BGP packets to the FRR.
+
+# Options for punt
+In VPP we have several options on how we can punt control packets to the host.
+* Router plugin
+* Active punt (in unix-socket)
+* Passive punt (though IP redirect)
+* VCL (VPP communication library)
+
+Also, you can read more about punting in VPP [here](https://docs.fd.io/vpp/19.08/md_src_vnet_ip_punt.html).
+
+# Router plugin
+It's an outdated and not supported solution. This plugin just does several things:
+1. Create a TAP interface (in the host) for each of your routing interfaces in VPP.
+2. Configure IP address and ARP entries in the host network.
+3. Just mirror all the traffic to the host interfaces - at this moment every routing daemon will work and install routes into the host.
+4. Listen on Netlink socket and install all the routes (which installed into the host) to VPP FIB.
+
+But this solution is pretty "crutch". Also, not many people consider this plugin should be as part of VPP (you can find some thoughts about it [here](https://lists.fd.io/g/vpp-dev/topic/32309215)).
+
+# Active punt
+At this moment it just supports only UDP and sinks all the traffic into the UNIX-socket file. So obviously it doesn't fit our requirements - we don't want to rewrite routing daemons much. Also, we need L2, L3 and TCP packets, UDP is not a very handful.
+
+# Passive punt
+Actually, this is the first option which fits and - a super-easy solution. We can just redirect traffic destined to the IP addresses of VPP interfaces to some TAP interface in the host (sounds pretty like router plugin but much simpler).
+
+```
+DBGvpp# create tap id 0 host-ip4-addr 10.0.0.0/31 host-ns bgp-cp host-if-name bgp-cp
+tap0
+DBGvpp# set interface state tap0 up
+DBGvpp# set interface ip address tap0 10.0.0.1/31
+DBGvpp# create tap id 1 host-ip4-addr 10.0.1.0/31 host-ns external-peer host-if-name external_peer
+tap1
+DBGvpp# set interface state tap1 up
+DBGvpp# set interface ip address tap1 10.0.1.1/31
+DBGvpp# ip punt redirect add rx tap1 via 10.0.0.0 tap0
+```
+We need to build some setup in NetNS, run these in different terminals:
+```
+sudo ip netns exec bgp-cp ip link set dev lo up
+sudo ip netns exec bgp-cp bgpd -u root -t -i /tmp/bgp.pid -f ./bgp-cp.conf -z /tmp/bgp-cp.sock
+sudo ip netns exec bgp-cp zebra -f /etc/frr/zebra.conf -u root -M fpm:protobuf -t -z /tmp/bgp-cp.sock
+```
+
+Let's check BGP status:
+```
+vppbuild# sh ip bgp su
+
+IPv4 Unicast Summary:
+BGP router identifier 3.3.3.3, local AS number 31337 vrf-id 0
+BGP table version 5
+RIB entries 5, using 920 bytes of memory
+Peers 1, using 20 KiB of memory
+
+Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd
+10.0.1.0        4      31337      14      19        0    0    0 00:01:05            1
+
+Total number of neighbors 1
+```
+
+Zebra will push all the routes straight to our fibmgr:
+```
+type: ADD_ROUTE
+add_route {
+  vrf_id: 0
+  address_family: IPV4
+  sub_address_family: UNICAST
+  key {
+    prefix {
+      length: 32
+      bytes: "\010\010\010\010"
+    }
+  }
+  route_type: NORMAL
+  protocol: BGP
+  metric: 0
+  nexthops {
+    if_id {
+      index: 7
+    }
+    address {
+      v4 {
+        value: 167772416
+      }
+    }
+  }
+}
+adding route
+32
+successfully installed route: 14
+```
+
+And this route also installed into VPP:
+```
+DBGvpp# sh ip fib 8.8.8.8
+ipv4-VRF:0, fib_index:0, flow hash:[src dst sport dport proto ] epoch:0 flags:none locks:[adjacency:1, default-route:1, nat-hi:2, ]
+8.8.8.8/32 fib:0 index:12 locks:2
+  API refs:1 src-flags:added,contributing,active,
+    path-list:[19] locks:2 flags:shared, uPRF-list:14 len:1 itfs:[0, ]
+      path:[19] pl-index:19 ip4 weight=1 pref=0 attached-nexthop:
+        10.0.1.0 local0
+      [@0]: ipv4 via 10.0.1.0 local0: mtu:9000
+```
+
+And here we are, a working BGP into separate NetNS - sounds pretty cool! But keep in mind that IP redirect punt works as just expected - it routes packets, so TTL will be decreased by 1. In the case of eBGP, we need to figure something out (like enable ebgp-multihop).
+
+## Next time
+This option of punting packets to the control plane doesn't look good for me. It works just for IP traffic (some protocols required L2 connectivity). Next time I will try a more sophisticated variant of integration some BGP daemon and VPP - VCL.
