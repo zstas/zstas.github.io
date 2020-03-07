@@ -1,9 +1,16 @@
+---
+layout: post
+title:  "VPP Host Stack"
+date:   2020-03-07 11:00:00 +0300
+categories: jekyll update
+---
+
 ## VPP Communication Library
 
-# Does have VPP its own IP/TCP stack?
-Surely do. And there is possibility to force your legacy application to work with it!
+# Does VPP have its IP/TCP stack?
+Surely do. And there is a possibility to force your legacy application to work with it!
 
-We have VCL library in VPP. Let's see what functions it has.
+We have a VCL library in VPP. Let’s see what functions it has.
 
 ```
 zstas@vppbuild:~$ readelf -s /usr/lib/x86_64-linux-gnu/libvcl_ldpreload.so
@@ -31,10 +38,10 @@ Symbol table '.dynsym' contains 140 entries:
 ...
 ```
 
-All you need is export LD_PRELOAD with this library when running your application. Let's see how it works. I'm going to run 2 BGP daemons, one will be acting as peer for VPP. And the other will use VPP's host stack to connect to this peer.
+All you need is to export LD_PRELOAD with this library when running your application. Let's see how it works. I'm going to run 2 BGP daemons, one will be acting as a peer for VPP. And the other will use VPP's host stack to connect to this peer.
 
 # Let's build this setup!
-Firt of all we need to create interface to outside world:
+First of all, we need to create an interface to the outside world:
 ```
 create tap host-ns external-peer host-ip4-addr 10.0.0.1/31
 set interface state tap0 up
@@ -46,7 +53,7 @@ Next, run the BGPD which would act as peer:
 sudo ip netns exec external-peer bgpd -t -u root -Z
 ```
 
-Also we need to prepare a little config for VCL:
+Also, we need to prepare a little config for VCL:
 ```
 zstas@vppbuild:~$ cat frr_vcl.conf
 vcl {
@@ -58,7 +65,7 @@ vcl {
 }
 ```
 
-I chose BIRD to show this case, because it's only BGP daemon which doesn't fork. Because after fork LD_PRELOAD is break and I don't know how to fix it. Also I switched off several things in BIRD to make it working, there is the patch:
+I chose BIRD to show this case because it's only BGP daemon which doesn't fork. Because after fork LD_PRELOAD doesn't work and I don’t know how to fix it. Also, I switched off several things in BIRD to make it work, there is the patch:
 ```
 diff --git a/sysdep/unix/io.c b/sysdep/unix/io.c
 index 53a37a50..5cec89df 100644
@@ -178,7 +185,7 @@ vppcom_session_accept:1642: vcl<1728:0>: listener 0 [0x14] accepted 1 [0x1] peer
 fcntl64:502: ldp<1728>: fd 33 vlsh 1, cmd 4
 ```
 
-As you see above - it successfully bind on TCP/179 and also accepted the connection.
+As you see above - it successfully bound on TCP/179 and also accepted the connection.
 
 Let's check that BGP is working.
 ```
@@ -206,7 +213,7 @@ Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/P
 Total number of neighbors 1
 ```
 
-We can see this sessions in VPP:
+We can see these sessions in VPP:
 ```
 DBGvpp# show session verbose
 Connection                                        State          Rx-f      Tx-f
@@ -216,4 +223,4 @@ Thread 0: active sessions 2 closed 9
 ```
 
 # What's next
-But unfortunately BIRD doesn't have an API to dump all the routing table (and install it through our VPP FIB Manager). So I'm still digging into it. Stay tuned!
+But unfortunately, BIRD doesn't have an API to dump the routing table (and install it through our VPP FIB Manager). So I'm still digging into it. Stay tuned!
