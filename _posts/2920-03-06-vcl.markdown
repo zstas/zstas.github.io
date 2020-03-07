@@ -1,0 +1,219 @@
+## VPP Communication Library
+
+# Does have VPP its own IP/TCP stack?
+Surely do. And there is possibility to force your legacy application to work with it!
+
+We have VCL library in VPP. Let's see what functions it has.
+
+```
+zstas@vppbuild:~$ readelf -s /usr/lib/x86_64-linux-gnu/libvcl_ldpreload.so
+
+Symbol table '.dynsym' contains 140 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+... this library is exporting functions with same names as in libc
+    67: 000000000000e31b  1097 FUNC    GLOBAL DEFAULT   12 connect
+    75: 0000000000010263   458 FUNC    GLOBAL DEFAULT   12 listen
+    90: 000000000000d99d   498 FUNC    GLOBAL DEFAULT   12 socket
+   128: 000000000001071c    44 FUNC    GLOBAL DEFAULT   12 accept
+   129: 000000000000f4b5   176 FUNC    GLOBAL DEFAULT   12 recv
+   133: 000000000000f565   371 FUNC    GLOBAL DEFAULT   12 sendto
+   134: 0000000000011228  2922 FUNC    GLOBAL DEFAULT   12 poll
+   138: 000000000000dcc4   965 FUNC    GLOBAL DEFAULT   12 bind
+... it also has functions which actually calls the libc functions.
+    94: 0000000000003c64   101 FUNC    GLOBAL DEFAULT   12 libc_connect
+   111: 00000000000040bd    95 FUNC    GLOBAL DEFAULT   12 libc_listen
+   125: 000000000000455a    99 FUNC    GLOBAL DEFAULT   12 libc_socket
+   120: 0000000000003b41   103 FUNC    GLOBAL DEFAULT   12 libc_accept
+   119: 00000000000041e8   107 FUNC    GLOBAL DEFAULT   12 libc_recv
+    77: 000000000000446e   123 FUNC    GLOBAL DEFAULT   12 libc_sendto
+   126: 0000000000004a34   104 FUNC    GLOBAL DEFAULT   12 libc_poll
+   135: 0000000000003ba8   101 FUNC    GLOBAL DEFAULT   12 libc_bind
+...
+```
+
+All you need is export LD_PRELOAD with this library when running your application. Let's see how it works. I'm going to run 2 BGP daemons, one will be acting as peer for VPP. And the other will use VPP's host stack to connect to this peer.
+
+# Let's build this setup!
+Firt of all we need to create interface to outside world:
+```
+create tap host-ns external-peer host-ip4-addr 10.0.0.1/31
+set interface state tap0 up
+set interface ip address tap0 10.0.0.0/31
+```
+
+Next, run the BGPD which would act as peer:
+```
+sudo ip netns exec external-peer bgpd -t -u root -Z
+```
+
+Also we need to prepare a little config for VCL:
+```
+zstas@vppbuild:~$ cat frr_vcl.conf
+vcl {
+  rx-fifo-size 4000000
+  tx-fifo-size 4000000
+  app-scope-local
+  app-scope-global
+  api-socket-name /run/vpp-api.sock
+}
+```
+
+I chose BIRD to show this case, because it's only BGP daemon which doesn't fork. Because after fork LD_PRELOAD is break and I don't know how to fix it. Also I switched off several things in BIRD to make it working, there is the patch:
+```
+diff --git a/sysdep/unix/io.c b/sysdep/unix/io.c
+index 53a37a50..5cec89df 100644
+--- a/sysdep/unix/io.c
++++ b/sysdep/unix/io.c
+@@ -738,8 +738,8 @@ sk_prepare_cmsgs6(sock *s, struct msghdr *msg, void *cbuf, size_t cbuflen)
+ static inline int
+ sk_set_ttl4(sock *s, int ttl)
+ {
+-  if (setsockopt(s->fd, SOL_IP, IP_TTL, &ttl, sizeof(ttl)) < 0)
+-    ERR("IP_TTL");
++  // if (setsockopt(s->fd, SOL_IP, IP_TTL, &ttl, sizeof(ttl)) < 0)
++  //   ERR("IP_TTL");
+
+   return 0;
+ }
+@@ -1192,7 +1192,7 @@ sk_setup(sock *s)
+   int y = 1;
+   int fd = s->fd;
+
+-  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
++  if (fcntl64(fd, F_SETFL, O_NONBLOCK) < 0)
+     ERR("O_NONBLOCK");
+
+   if (!s->af)
+@@ -1256,9 +1256,9 @@ sk_setup(sock *s)
+       if (sk_set_ttl4(s, s->ttl) < 0)
+        return -1;
+
+-    if (s->tos >= 0)
+-      if (sk_set_tos4(s, s->tos) < 0)
+-       return -1;
++  //   if (s->tos >= 0)
++  //     if (sk_set_tos4(s, s->tos) < 0)
++       // return -1;
+   }
+
+   if (sk_is_ipv6(s))
+@@ -1457,7 +1457,7 @@ sk_open(sock *s)
+          log(L_WARN "Socket error: %s%#m", s->err);
+
+     sockaddr_fill(&sa, af, bind_addr, s->iface, bind_port);
+-    if (bind(fd, &sa.sa, SA_LEN(sa)) < 0)
++    if (bind(fd, &sa.sa, sizeof (struct sockaddr_in)) < 0)
+       ERR2("bind");
+   }
+
+@@ -1469,7 +1469,7 @@ sk_open(sock *s)
+   {
+   case SK_TCP_ACTIVE:
+     sockaddr_fill(&sa, af, s->daddr, s->iface, s->dport);
+-    if (connect(fd, &sa.sa, SA_LEN(sa)) >= 0)
++    if (connect(fd, &sa.sa, sizeof (struct sockaddr_in)) >= 0)
+       sk_tcp_connected(s);
+     else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS &&
+             errno != ECONNREFUSED && errno != EHOSTUNREACH && errno != ENETUNREACH)
+@@ -1510,7 +1510,7 @@ sk_open_unix(sock *s, char *name)
+   if (fd < 0)
+     return -1;
+
+-  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
++  if (fcntl64(fd, F_SETFL, O_NONBLOCK) < 0)
+     return -1;
+
+   /* Path length checked in test_old_bird() */
+@@ -1850,7 +1850,7 @@ sk_write(sock *s)
+       sockaddr sa;
+       sockaddr_fill(&sa, s->af, s->daddr, s->iface, s->dport);
+
+-      if (connect(s->fd, &sa.sa, SA_LEN(sa)) >= 0 || errno == EISCONN)
++      if (connect(s->fd, &sa.sa, sizeof (struct sockaddr_in)) >= 0 || errno == EISCONN)
+        sk_tcp_connected(s);
+       else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS)
+        s->err_hook(s, errno);
+```
+
+And now we can run the BIRD!
+```
+zstas@vppbuild:~/bird$ sudo LD_PRELOAD=/home/zstas/vpp/build-root/install-vpp_debug-native/vpp/lib/libvcl_ldpreload.so LDP_PATH=/home/zstas/frr_ldp.conf ./bird -d -c /etc/bird/bird.conf -u root
+VCL<1728>: using default heapsize 268435456 (0x10000000)
+VCL<1728>: allocated VCL heap = 0x7f886b568010, size 268435456 (0x10000000)
+VCL<1728>: using default configuration.
+vppcom_connect_to_vpp:465: vcl<1728:0>: app (ldp-1728-app) connecting to VPP api (/vpe-api)...
+close:335: ldp<1728>: fd 3: calling libc_close
+close:335: ldp<1728>: fd 3: calling libc_close
+close:335: ldp<1728>: fd 3: calling libc_close
+vppcom_connect_to_vpp:480: vcl<1728:0>: app (ldp-1728-app) is connected to VPP!
+vppcom_app_create:1174: vcl<1728:0>: sending session enable
+vppcom_app_create:1182: vcl<1728:0>: sending app attach
+vppcom_app_create:1191: vcl<1728:0>: app_name 'ldp-1728-app', my_client_index 256 (0x100)
+ldp_init:286: ldp<1728>: LDP initialization: done!
+ldp_constructor:2490: LDP<1728>: LDP constructor: done!
+socket:996: ldp<1728>: calling libc_socket
+connect:1267: ldp<1728>: fd 4: calling libc_connect(): addr 0x7ffe164b9d10, len 10
+close:335: ldp<1728>: fd 4: calling libc_close
+socket:996: ldp<1728>: calling libc_socket
+fcntl64:502: ldp<1728>: fd 4 vlsh -1, cmd 4
+bind:1097: ldp<1728>: fd 4: calling libc_bind: addr 0x7ffe164b9d10, len 10
+listen:2016: ldp<1728>: fd 4: calling libc_listen(): n 8
+close:335: ldp<1728>: fd 5: calling libc_close
+socket:996: ldp<1728>: calling libc_socket
+socket:996: ldp<1728>: calling libc_socket
+socket:996: ldp<1728>: calling libc_socket
+bind:1097: ldp<1728>: fd 7: calling libc_bind: addr 0x7ffe164b9cbc, len 12
+fcntl64:502: ldp<1728>: fd 7 vlsh -1, cmd 4
+bird: Started
+socket:974: ldp<1728>: calling vls_create: proto 0 (TCP), is_nonblocking 0
+vppcom_session_create:1249: vcl<1728:0>: created session 0
+fcntl64:502: ldp<1728>: fd 32 vlsh 0, cmd 4
+bind:1086: ldp<1728>: fd 32: calling vls_bind: vlsh 0, addr 0x7ffe164b9c70, len 16
+vppcom_session_bind:1396: vcl<1728:0>: session 0 handle 0: binding to local IPv4 address 0.0.0.0 port 179, proto TCP
+listen:2005: ldp<1728>: fd 32: calling vls_listen: vlsh 0, n 8
+vppcom_session_listen:1428: vcl<1728:0>: session 0: sending vpp listen request...
+vcl_session_bound_handler:604: vcl<1728:0>: session 0 [0x14]: listen succeeded!
+ldp_accept4:2043: ldp<1728>: listen fd 32: calling vppcom_session_accept: listen sid 0, ep 0x0, flags 0x164b9b80
+vppcom_session_accept:1642: vcl<1728:0>: listener 0 [0x14] accepted 1 [0x1] peer: 10.0.0.1:60808 local: 0.0.0.0:179
+fcntl64:502: ldp<1728>: fd 33 vlsh 1, cmd 4
+```
+
+As you see above - it successfully bind on TCP/179 and also accepted the connection.
+
+Let's check that BGP is working.
+```
+zstas@vppbuild:~/bird$ sudo ./birdc
+BIRD 1.6.4 ready.
+bird> show protocols bgp1
+name     proto    table    state  since       info
+bgp1     BGP      master   up     11:45:50    Established
+bird> show route
+8.8.8.8/32         unreachable [bgp1 11:45:50 from 10.0.0.1] * (100/-) [i]
+```
+Peer:
+```
+vppbuild# sh ip bgp su
+
+IPv4 Unicast Summary:
+BGP router identifier 1.1.1.1, local AS number 31337 vrf-id 0
+BGP table version 1
+RIB entries 1, using 184 bytes of memory
+Peers 1, using 20 KiB of memory
+
+Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd
+10.0.0.0        4      31337      90     120        0    0    0 00:02:48            0
+
+Total number of neighbors 1
+```
+
+We can see this sessions in VPP:
+```
+DBGvpp# show session verbose
+Connection                                        State          Rx-f      Tx-f
+[0:3][T] 0.0.0.0:179->0.0.0.0:0                   LISTEN         0         0
+[0:10][T] 10.0.0.0:179->10.0.0.1:60696            ESTABLISHED    81        0
+Thread 0: active sessions 2 closed 9
+```
+
+# What's next
+But unfortunately BIRD doesn't have an API to dump all the routing table (and install it through our VPP FIB Manager). So I'm still digging into it. Stay tuned!
