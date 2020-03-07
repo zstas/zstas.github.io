@@ -66,6 +66,9 @@ vcl {
 ```
 
 I chose BIRD to show this case because it's only BGP daemon which doesn't fork. Because after fork LD_PRELOAD doesn't work and I don’t know how to fix it. Also, I switched off several things in BIRD to make it work, there is the patch:
+<details><summary>Patch for BIRD</summary>
+<p>
+
 ```
 diff --git a/sysdep/unix/io.c b/sysdep/unix/io.c
 index 53a37a50..5cec89df 100644
@@ -142,6 +145,8 @@ index 53a37a50..5cec89df 100644
         s->err_hook(s, errno);
 ```
 
+</p>
+</details>
 And now we can run the BIRD!
 ```
 zstas@vppbuild:~/bird$ sudo LD_PRELOAD=/home/zstas/vpp/build-root/install-vpp_debug-native/vpp/lib/libvcl_ldpreload.so LDP_PATH=/home/zstas/frr_ldp.conf ./bird -d -c /etc/bird/bird.conf -u root
