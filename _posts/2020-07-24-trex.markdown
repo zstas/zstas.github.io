@@ -1,0 +1,174 @@
+---
+layout: post
+title:  "Traffic generator for vBNG"
+date:   2020-07-24 12:30:15 +0300
+categories: trex pppoe vbng
+---
+
+## Intro 
+I have some significant progress with my PPP Control Plane Daemon. Now it could handle up to 65K PPPoE sessions. But it always interesting how much traffic could handle the whole setup. This article is just short notice of how to use the traffic generator with vBNG.
+
+# TREX
+TREX is a popular open-source traffic generator. The cool thing with TREX is that you can write some logic with Scapy (Python), generate some traffic flows, and TREX would generate much traffic with these rules. 
+
+In my examples, I use "NONE" authentication for sessions (we don't want to measure RADIUS server speed, right?).
+
+# Services
+There is the support of "services" in TREX. You can see examples of DHCP clients, for example, ```trex-core/scripts/automation/trex_control_plane/interactive/trex/examples/stl/stl_pppoe_example.py```
+
+I write service for PPPoE, based on this DHCP example. Although, it was pretty easy. First of all, you need to specify the filter for control-plane packets.
+
+```
+class ServiceFilterPPPOE(ServiceFilter):
+    '''
+        Service filter for PPPOE services
+    '''
+    def __init__ (self):
+        self.services = defaultdict(list)
+        
+        
+    def add (self, service):
+        self.services[service.get_mac()].append(service)
+        
+        
+    def lookup (self, pkt): 
+        # correct MAC is enough to verify ownership
+        mac = Ether(pkt).dst
+        # print( 'Looking up for packet with dstmac: {0}'.format(mac))
+        
+        return self.services.get(mac, [])
+
+        
+    def get_bpf_filter (self):
+        return 'pppoed or (pppoes and not ( ppp proto 0x0021 or ppp proto 0x0057 ) )'
+```
+
+To generate some traffic we need to do several things. Actual steps are trivial:
+1. PPPoE Discovery stage
+2. LCP + Auth (PAP or CHAP) + IPCP
+3. Generating some traffic profiles with given data (PPPoE session-id, IP address, MAC of PPPoE AC)
+
+There is how it's looked:
+```c#
+################### internal ###################
+class ServicePPPOE(Service):
+    
+    # PPPOE states
+    INIT, SELECTING, REQUESTING, LCP, AUTH, IPCP, BOUND = range(7)
+    
+    def __init__ (self, mac, verbose_level = Service.ERROR):
+...
+        self.mac        = mac
+        
+        self.record = None
+        self.state  = 'INIT'
+
+        # Pkt queue
+        self.pkt_queue = []
+
+        # States for PPPoE
+        self.session_id = 0
+
+        # States for LCP
+        self.lcp_our_sent = False
+        self.lcp_our_negotiated = False
+        self.lcp_peer_negotiated = False
+
+         # States for IPCP
+        self.ipcp_our_sent = False
+        self.ipcp_our_negotiated = False
+        self.ipcp_peer_negotiated = False
+...
+    #########################  protocol state machines  #########################
+    
+    def run (self, pipe):
+        
+        # while running under 'INIT' - perform acquire
+        if self.state == 'INIT':
+            return self._acquire(pipe)
+        elif self.state == 'BOUND':
+            return self._release(pipe)
+            
+        
+    def _acquire (self, pipe):
+        '''
+            Acquire PPPOE lease protocol
+        '''
+        
+        # main state machine loop
+        self.state   = 'INIT'
+        self.record  = None
+        self.retries = 5
+        
+        while True:
+            
+            # INIT state
+            if self.state == 'INIT':
+
+                self.retries -= 1
+                if self.retries <= 0:
+                    break
+                    
+                self.log('PPPOE: {0} ---> PADI'.format(self.mac))
+                
+                padi = Ether(src=self.get_mac_bytes(),dst="ff:ff:ff:ff:ff:ff")/PPPoED(version=1,type=1,code="PADI",sessionid=0,len=0)
+
+                # send a discover message
+                yield pipe.async_tx_pkt(padi)
+                
+                self.state = 'SELECTING'
+                continue
+...
+```
+
+# Benchmarking
+Unfortunately, I cannot get the setup with real hardware, so there won't be any results.
+
+```
+zstas@ubuntutest:~/trex-core/scripts$ python3 ./automation/trex_control_plane/interactive/trex/examples/stl/stl_pppoe_example.py
+How many PPPoE clients to create: 5
+
+*** step 1: starting PPPoE acquire for 5 clients ***
+
+
+*** step 2: PPPoE acquire results ***
+
+client: MAC a5:29:82:30:25:08 - PPPoE: ip: 100.64.0.10, server_ip: 100.64.0.1
+client: MAC a7:85:11:48:b2:f6 - PPPoE: ip: 100.64.0.11, server_ip: 100.64.0.1
+client: MAC b8:8e:ab:0e:67:74 - PPPoE: ip: 100.64.0.12, server_ip: 100.64.0.1
+client: MAC ba:5a:61:39:ed:b6 - PPPoE: ip: 100.64.0.13, server_ip: 100.64.0.1
+client: MAC a0:41:55:a5:e9:a4 - PPPoE: ip: 100.64.0.14, server_ip: 100.64.0.1
+
+
+Press Return to generate high speed traffic from all clients...
+
+
+*** step 4: generating UDP traffic from 5 clients ***
+
+^C'wait_on_traffic' - interrupted by a keyboard signal (probably ctrl + c)
+```
+
+How to generate streams:
+```c#
+for client in clients:
+            record = client.get_record()
+            base_pkt = Ether(src=record.client_mac,dst=record.server_mac)/PPPoE(sessionid=record.sid)/PPP(proto="Internet Protocol version 4")/IP(src=record.client_ip,dst='8.8.8.8')/UDP()
+            pkt = STLPktBuilder(pkt = base_pkt, vm = [])
+            
+            streams.append(STLStream(packet = pkt, mode = STLTXCont(pps = 1000)))
+        
+        self.c.add_streams(ports = self.port, streams = streams)
+        self.c.start(ports = [0], mult = '100%')
+        self.c.wait_on_traffic(ports=[0,1])
+```
+
+Of course, you can generate all kinds of traffic for these particular sessions, even load pcap. 
+
+# Cons
+The only con I've met - it's Scapy performance. On my setup, it could generate only about 1K subscribers simultaneously. If you would try to generate more, Scapy will choke with so many packets. The PPS rate on my setup is below 100 PPS. In the DHCP service example author write a specific class to deal with that problem. It called FastParser, and it just remembers the offset of fields in the packets. Anyway, it's not easy to use, because you need to deal with plain bytes and compute all the lengths and checksums by yourself. 
+
+Of course, after establishing sessions, you can get all the performance from TREX (way more than 10gbps).
+
+# Outro
+You can find scripts for PPPoE testing in my [Github](https://github.com/zstas/trex-pppoe).
+Also, you can use (or even rework) examples for DHCP to emulate some IPoE subscribers. 
