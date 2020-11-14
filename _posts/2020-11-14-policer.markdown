@@ -1,0 +1,161 @@
+---
+layout: post
+title:  "Policer in VPP"
+date:   2020-11-14 12:00:00 +0300
+categories: jekyll update
+---
+
+## Intro
+# Subject
+Our BNG definitely lacks a policer on the PPPoE interface. VPP has the feature of policing with classifier (L2/IPv4/IPv6), but we need something simpler and faster (why do we need to classify traffic, if we need only to police traffic on the whole interface?).
+
+# Existing code
+There is some existing code, which is very similar to our needs. The VPP node is called `policer-by-sw-if-index`, but it works only on the RX side. So, I've written the patch, that introduces new nodes: `policer-interface-rx` and `policer-interface-tx`.
+
+# Arcs and Nodes
+VPP has a very robust graph model, and we can insert our node in every feature\arc. Policer on RX should work before any calculation is made, so our choice will be the `device-input` arc.
+
+```
+vnet_feature_enable_disable ("device-input", "policer-interface-rx",
+        rx_sw_if_index, is_add, 0, 0);
+```
+
+Otherwise, the TX node should be called just before interface output, and we'll set it on the `interface-output` arc.
+
+```
+vnet_feature_enable_disable ("interface-output", "policer-interface-tx",
+        rx_sw_if_index, is_add, 0, 0);
+```
+
+Also, we should point to the next nodes and previous nodes (`.runs_before`):
+
+```
+VLIB_REGISTER_NODE (policer_interface_rx_node) = {
+    .vector_size = sizeof (u32),
+    .format_trace = format_policer_trace,
+    .type = VLIB_NODE_TYPE_INTERNAL,
+    .n_errors = ARRAY_LEN (vnet_policer_error_strings),
+    .error_strings = vnet_policer_error_strings,
+
+    .n_next_nodes = VNET_POLICER_N_NEXT,
+
+    /* edit / add dispositions here */
+    .next_nodes =
+        {
+            [VNET_POLICER_NEXT_TRANSMIT] = "ethernet-input",
+            [VNET_POLICER_NEXT_DROP] = "error-drop",
+        },
+    .name = "policer-interface-rx",
+};
+
+VLIB_REGISTER_NODE (policer_interface_tx_node) = {
+    .vector_size = sizeof (u32),
+    .format_trace = format_policer_trace,
+    .type = VLIB_NODE_TYPE_INTERNAL,
+    .n_errors = ARRAY_LEN (vnet_policer_error_strings),
+    .error_strings = vnet_policer_error_strings,
+
+    .n_next_nodes = VNET_POLICER_N_NEXT,
+
+    /* edit / add dispositions here */
+    .next_nodes =
+        {
+            [VNET_POLICER_NEXT_TRANSMIT] = "interface-tx",
+            [VNET_POLICER_NEXT_DROP] = "error-drop",
+        },
+    .name = "policer-interface-tx",
+};
+
+VNET_FEATURE_INIT (policer_interface_rx_node, static) = {
+    .arc_name = "device-input",
+    .node_name = "policer-interface-rx",
+    .runs_before = VNET_FEATURES ("ethernet-input"),
+};
+
+VNET_FEATURE_INIT (policer_interface_tx_node, static) = {
+    .arc_name = "interface-output",
+    .node_name = "policer-interface-tx",
+    .runs_before = VNET_FEATURES ("interface-tx"),
+};
+```
+
+So our next nodes will be `ethernet-input` on RX and `interface-tx` on TX. Very simple, right?
+
+# API
+VPP has its own C-like syntaxis to write API types and methods. 
+
+E.g. let's see our new API method in `policer.api`:
+```
+/** \brief Set policer on interface (tx or/and rx)
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param name - policer name
+    @param sw_if_index - interface to set/unset policer
+    @param direction - direction of policer: tx or rx
+    @param is_add - set policer on interface if non-zero, else delete
+*/
+autoreply define set_policer_intfc_add_del
+{
+  u32 client_index;
+  u32 context;
+
+  string name[64];
+  vl_api_interface_index_t sw_if_index;
+  vl_api_policer_intfc_direction_t direction;
+  bool is_add;
+};
+```
+
+`client_index` and `context` are generic for all API methods. `vl_api_interface_index_t` is also standart type for specifing sw_if_index. `vl_api_policer_intfc_direction_t` is our new type (in policer_types.api).
+
+```
+enum policer_intfc_direction : u8
+{
+  POLICER_INTFC_TX = 0,
+  POLICER_INTFC_RX,
+};
+```
+
+`autoreply` means that we will send back just the status of the operation (otherwise, we should write type for the answer on that API method).
+
+Next thing, we should add our new API method in C code.
+
+```
+#define foreach_vpe_api_msg                             \
+_(POLICER_ADD_DEL, policer_add_del)                     \
+_(SET_POLICER_INTFC_ADD_DEL, set_policer_intfc_add_del) \
+_(POLICER_DUMP, policer_dump)
+```
+
+The function itself also very simple:
+```static void
+vl_api_set_policer_intfc_add_del_t_handler (vl_api_set_policer_intfc_add_del_t
+					    * mp)
+{
+  vl_api_set_policer_intfc_add_del_reply_t *rmp;
+  int rv = -1;
+
+  switch (mp->direction)
+    {
+    case POLICER_INTFC_TX:
+      rv =
+	set_policer_add_del (mp->sw_if_index, mp->name, mp->is_add,
+			     VNET_POLICER_INDEX_IF_TX);
+      break;
+    case POLICER_INTFC_RX:
+      rv =
+	set_policer_add_del (mp->sw_if_index, mp->name, mp->is_add,
+			     VNET_POLICER_INDEX_IF_RX);
+      break;
+    }
+
+  REPLY_MACRO (VL_API_SET_POLICER_INTFC_ADD_DEL_REPLY);
+}
+```
+
+It's not a big deal to add new API methods in VPP, huh?
+
+## Outro
+Of course, I'll add this new functionality in my PPPoE Control Plane Daemon project, if my patch will be merged.
+
+My next article won't be on the BNG subject, because I run out of new ideas in this area.
