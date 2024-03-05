@@ -5,6 +5,9 @@ permalink: /about/
 ---
 Hello!
 
-I'm a software engineer with a big networking experience. I used to work in ISP many years, so I find exciting to try new open-sourced libraries, dataplanes, etc.
+I'm a software engineer with a passion of networks. I worked many years in ISP and then I switched to SDN field.
 
-You can find there my thoughts about how you can build VNFs.
+I'm interested in:
+* VPP
+* DPDK
+* Writing control and data planes for SDN stacks
