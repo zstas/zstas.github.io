@@ -32,6 +32,7 @@ The previous solution won't work for LXD/Incus/Docker, since they create their o
 
 The latted would force lxd/incus to create its cgroups within the parent (e.g. `system.slice`). And one can enjoy a more beatiful solution for managing isolated and non-isolated cores from one place.
 
-[0] - https://documentation.suse.com/sle-rt/15-SP5/html/SLE-RT-all/cha-shielding-with-systemd.html
-[1] - https://github.com/lxc/incus/issues/492#issuecomment-1969975994
+[0] - [https://documentation.suse.com/sle-rt/15-SP5/html/SLE-RT-all/cha-shielding-with-systemd.html]
+
+[1] - [https://github.com/lxc/incus/issues/492#issuecomment-1969975994]
 
